@@ -144,6 +144,7 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
     return result
 
 def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
+    """Now effectively extracts the string Customer Name from the raw PDF text."""
     records = []
     try:
         reader = PdfReader(pdf_file)
@@ -151,15 +152,36 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
         for page in reader.pages:
             full_text += page.extract_text() or ""
             
-        text_stream = full_text.replace("\n", " ").replace("$", " ")
-        text_tokens = text_stream.split()
-        
-        for idx, token in enumerate(text_tokens):
-            if "INV-" in token.upper():
-                inv_id = re.sub(r'[^A-Za-z0-9\-]', '', token.upper())
+        # Parse line by line to preserve spacing context for the business name
+        for line in full_text.split('\n'):
+            if "INV-" in line.upper():
+                inv_match = re.search(r"(INV-[A-Za-z0-9\-]+)", line, re.IGNORECASE)
+                if not inv_match:
+                    continue
+                inv_id = inv_match.group(1).upper()
                 
-                forward_pool = []
-                for step in range(1, 15):
-                    if idx + step < len(text_tokens):
-                        potential_num = text_tokens[idx + step].replace(",", "")
-                        if re.fullmatch(r"[-+]?\d+\.\d{2}",
+                amounts = re.findall(r"\b\d+(?:,\d{3})*\.\d{2}\b", line)
+                if not amounts:
+                    continue
+                    
+                gross = clean_numeric_value(amounts[0])
+                fee = clean_numeric_value(amounts[1]) if len(amounts) > 1 else 0.0
+                
+                # Slices the text strictly between the INV tag and the first money amount
+                after_inv = line[inv_match.end():]
+                amount_match = re.search(r"\b\d+(?:,\d{3})*\.\d{2}\b", after_inv)
+                cust_name = None
+                
+                if amount_match:
+                    cust_name = after_inv[:amount_match.start()].replace('$', '').strip()
+                
+                if gross > 0 and not any(r.invoice_number == inv_id for r in records):
+                    records.append(ZohoRecord(
+                        customer_name=cust_name if cust_name else None,
+                        gross_amount=gross,
+                        merchant_fee=fee,
+                        invoice_number=inv_id
+                    ))
+    except Exception as e:
+        st.error(f"Error executing summary parser: {e}")
+    return records
