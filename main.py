@@ -201,9 +201,48 @@ else:
     diagnostic_logs = []
 
     for boa_rec in boa_records:
-        matched_zoho = [z for z in zoho_records if z.gross_amount > 0]
-        if not matched_zoho:
-            continue
+        payment_records = [
+    z for z in zoho_records
+    if z.transaction_type == "payment"
+]
+
+refund_records = [
+    z for z in zoho_records
+    if z.transaction_type == "refund"
+]
+
+if not payment_records:
+    continue
+
+total_gross = round(
+    sum(z.gross_amount for z in payment_records),
+    2
+)
+
+total_fees = round(
+    sum(z.merchant_fee for z in payment_records),
+    2
+)
+
+total_refunds = round(
+    sum(z.refund_amount for z in refund_records),
+    2
+)
+
+calculated_net = round(
+    total_gross - total_fees - total_refunds,
+    2
+)
+
+if abs(calculated_net - boa_rec.net_amount) > 0.01:
+    validation_errors.append(
+        f"🚨 Reconciliation mismatch. "
+        f"Calculated Net = {calculated_net}, "
+        f"Bank Net = {boa_rec.net_amount}"
+    )
+    continue
+
+matched_zoho = payment_records
 
         payment_records = [z for z in zoho_records if z.transaction_type == "payment"]
         refund_records = [z for z in zoho_records if z.transaction_type == "refund"]
@@ -298,6 +337,48 @@ if abs(calculated_net - boa_rec.net_amount) > 0.01:
             })
 
         if total_fees > 0:
+            # --------------------------------------------------
+# REFUND JOURNAL ENTRY
+# --------------------------------------------------
+
+if total_refunds > 0:
+
+    refund_desc = (
+        f"Zoho Refunds_{current_boa_description}"
+    )
+
+    all_journal_lines.append({
+        "Date": boa_rec.date,
+        "Voucher": "",
+        "Account name": "Refund Clearing",
+        "Company": "bwa",
+        "Account type": "Ledger",
+
+        # REPLACE WITH YOUR ACTUAL REFUND ACCOUNT
+        "Account": "REFUND-CLEARING-ACCOUNT",
+
+        "Posting Profile": "",
+        "Cash code": "OSF005",
+        "Description": refund_desc,
+
+        "Debit": total_refunds,
+        "Credit": "",
+
+        "Item sales tax group": "",
+        "Sales tax code": "",
+        "Offset company": "bwa",
+        "Bank Account Type": "Bank",
+        "Offset account": offset_acct,
+        "Offset transaction text": "",
+        "Currency": "USD",
+        "Exchange rate": 1.00,
+        "Item sales tax group2": "",
+        "Sales tax group": "AVATAX",
+        "Withholding tax group": "",
+        "Release date": "",
+        "Reversing entry": "No",
+        "Reversing date": ""
+    })
             current_boa_description = str(boa_rec.description)
             if len(processed_accounts) == 1:
                 acc = processed_accounts[0]
