@@ -10,7 +10,7 @@ import os
 import difflib
 
 # =====================================================================
-# 1. HARDCODED LAYOUTS & MAPPINGS
+# 1. HARDCODED BASELINE CONFIGURATIONS & MAPPINGS
 # =====================================================================
 CASH_CODE_MAPPING = {
     "due-on-receipt": ("AR001", "AR Collection_AP"),
@@ -43,7 +43,7 @@ D365_TEMPLATE_COLUMNS = [
 ]
 
 # =====================================================================
-# 2. DATA UTILITIES & HIGH-FIDELITY STRUCTURAL MODELS
+# 2. CORE STORAGE MODELS & STRING NORMALIZATION ENGINE
 # =====================================================================
 class BOARecord(BaseModel):
     date: Any
@@ -57,10 +57,9 @@ class ZohoRecord(BaseModel):
     merchant_fee: float = 0.0
     refund_amount: float = 0.0
     invoice_number: Optional[str] = None
-    fallback_personal_name: Optional[str] = None
-    transaction_type: str = "payment"
+    transaction_type: str = "payment"  # payment vs refund
     description: Optional[str] = None
-    transaction_key: Optional[str] = None
+    transaction_key: str
 
 class AccountMasterItem(BaseModel):
     account_number: str
@@ -98,11 +97,11 @@ def get_match_score(target: str, candidate: str) -> float:
     return difflib.SequenceMatcher(None, target, candidate).ratio()
 
 # =====================================================================
-# 3. ADVANCED WEB-STREAM EXTRACTION MODULES
+# 3. ADVANCED DIRECT STREAM PDF EXTRACTION ARCHITECTURE
 # =====================================================================
 def extract_invoice_metadata_from_stream(uploaded_file) -> Dict[str, Any]:
-    """Parses customer invoice memory buffers uploaded by shared web browser sessions."""
-    result = {"customer_name": None, "invoice_number": None, "gross_amount": 0.0}
+    """Extracts entity metadata from bulk supporting customer invoice uploads."""
+    result = {"customer_name": None, "invoice_number": None}
     try:
         reader = PdfReader(uploaded_file)
         full_text = ""
@@ -110,13 +109,10 @@ def extract_invoice_metadata_from_stream(uploaded_file) -> Dict[str, Any]:
             full_text += page.extract_text() or ""
             
         full_text_clean = " ".join(full_text.split())
-        
-        # Extract invoice ID directly from the memory file structure name metadata context
         inv_num = str(uploaded_file.name).replace(".pdf", "").upper()
         inv_match = re.search(r"(INV-[A-Za-z0-9\-]+)", full_text_clean, re.IGNORECASE)
         result["invoice_number"] = inv_match.group(1).upper() if inv_match else inv_num
         
-        # Execute text boundary isolation rules for Bill To layouts
         bill_to_match = re.search(r"Bill\s+To\s*(.*?)\s*Ship\s+To", full_text_clean, re.IGNORECASE | re.DOTALL)
         if bill_to_match:
             candidate = bill_to_match.group(1).strip()
@@ -127,7 +123,7 @@ def extract_invoice_metadata_from_stream(uploaded_file) -> Dict[str, Any]:
     return result
 
 def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
-    """Parses strictly row-by-row from the All Transactions table, ignoring layout summary boxes."""
+    """Strict row-by-row layout scanner that parses lines independently and handles missing invoices."""
     records = []
     try:
         reader = PdfReader(pdf_file)
@@ -140,29 +136,36 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
                 if not line_clean:
                     continue
                 
+                # CRITICAL RULE: Complete bypass block for layout summary box structures
                 if any(k in line_clean.lower() for k in ["payout summary", "total payout", "summary total", "statement total"]):
                     continue
                 
+                # Verify that the line contains trailing transaction numbers
                 num_matches = list(re.finditer(r"[-+]?\$?\d+(?:,\d{3})*\.\d{2}", line_clean))
                 if len(num_matches) < 3:
                     continue
                 
+                # Separate description text blocks from the following transaction numbers block
                 first_num_start = num_matches[0].start()
                 text_part = line_clean[:first_num_start].strip()
                 
+                # Purge inline dates/timestamps from textual description keys
                 text_part = re.sub(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', '', text_part)
                 text_part = re.sub(r'\b\d{4}[/\-]\d{1,2}[/\-]\d{1,2}\b', '', text_part)
                 text_part = re.sub(r'\b\d{1,2}:\d{2}(?::\d{2})?\b', '', text_part)
                 text_part = re.sub(r'\s+', ' ', text_part).strip()
                 
+                # Isolate standard invoice number patterns if present
                 inv_match = re.search(r"(INV-[A-Za-z0-9\-]+)", text_part, re.IGNORECASE)
                 inv_id = inv_match.group(1).upper() if inv_match else None
                 
+                # Extract pure description context label
                 zoho_desc = text_part
                 if inv_id:
                     zoho_desc = zoho_desc.replace(inv_match.group(0), "").strip()
                 zoho_desc = re.sub(r'[^A-Za-z0-9\s\.\,\&\-]', '', zoho_desc).strip()
                 
+                # Map extracted values based on line row index sequences
                 vals = [clean_numeric_value(m.group(0)) for m in num_matches]
                 raw_strs = [m.group(0) for m in num_matches]
                 
@@ -175,64 +178,62 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
                     fee_raw = vals[1]
                     refund_raw = vals[2] if len(vals) > 2 else 0.0
                 
+                # Structural Classification Matrix (Payment vs Refund)
                 is_refund = "refund" in line_clean.lower() or refund_raw > 0 or any("-" in s for s in raw_strs)
                 
-                if is_refund:
-                    transaction_type = "refund"
-                    gross_amount = 0.0
-                    merchant_fee = 0.0
-                    refund_amount = abs(refund_raw if refund_raw > 0 else gross_raw)
-                else:
-                    transaction_type = "payment"
-                    gross_amount = abs(gross_raw)
-                    merchant_fee = abs(fee_raw)
-                    refund_amount = 0.0
-                
                 row_counter += 1
-                records.append(ZohoRecord(
-                    customer_name=zoho_desc if len(zoho_desc) > 1 else "Unspecified Row Label",
-                    gross_amount=gross_amount,
-                    merchant_fee=merchant_fee,
-                    refund_amount=refund_amount,
-                    invoice_number=inv_id,
-                    transaction_type=transaction_type,
-                    description=zoho_desc,
-                    transaction_key=f"tx_{row_counter}_{gross_amount}_{merchant_fee}_{refund_amount}"
-                ))
+                unique_tx_key = f"tx_{row_counter}_{gross_raw}_{fee_raw}_{refund_raw}"
+                
+                if is_refund:
+                    records.append(ZohoRecord(
+                        customer_name=zoho_desc if len(zoho_desc) > 1 else "Unspecified Refund Entry",
+                        gross_amount=0.0,
+                        merchant_fee=0.0,
+                        refund_amount=abs(refund_raw if refund_raw > 0 else gross_raw),
+                        invoice_number=inv_id,
+                        transaction_type="refund",
+                        description=zoho_desc,
+                        transaction_key=unique_tx_key
+                    ))
+                else:
+                    records.append(ZohoRecord(
+                        customer_name=zoho_desc if len(zoho_desc) > 1 else "Unspecified Payment Entry",
+                        gross_amount=abs(gross_raw),
+                        merchant_fee=abs(fee_raw),
+                        refund_amount=0.0,
+                        invoice_number=inv_id,
+                        transaction_type="payment",
+                        description=zoho_desc,
+                        transaction_key=unique_tx_key
+                    ))
     except Exception as e:
-        st.error(f"Critical breakdown inside row-based table parser: {e}")
+        st.error(f"Critical execution error in row-based PDF parser engine: {e}")
     return records
 
 # =====================================================================
-# 4. STREAMLIT INTERFACE SETUP
+# 4. STREAMLIT DATA INTAKE LAYOUT
 # =====================================================================
 st.set_page_config(page_title="D365 General Journal Automation", layout="wide")
 st.title("D365 General Journal Automation Engine")
-st.subheader("Daily Operational Reconciliations Matrix")
+st.subheader("Daily Operational Reconciliations Matrix (Row-Based Verification Layout)")
 
 possible_paths = ["Account Masterlist.xlsx", "Account Masterlist.csv"]
 MASTERLIST_PATH = next((p for p in possible_paths if os.path.exists(p)), None)
 
 if not MASTERLIST_PATH:
-    st.error("❌ Configuration mapping ledger file `Account Masterlist.xlsx` is missing from the directory.")
+    st.error("❌ Baseline system reference file `Account Masterlist.xlsx` or `.csv` could not be located in workspace root.")
     st.stop()
 
 st.sidebar.header("📅 Daily Variable Inputs")
 boa_file = st.sidebar.file_uploader("1. Bank of America Report (Excel/CSV)", type=["xlsx", "csv"])
 zoho_file = st.sidebar.file_uploader("2. Zoho Transaction Summary Sheet (PDF)", type=["pdf"])
-
-# SHARED APP CONVENIENCE FEATURE: Interactive multiple-file upload drop zone container
-uploaded_invoices = st.sidebar.file_uploader(
-    "3. Drop supporting customer invoices here (PDFs) [Optional]", 
-    type=["pdf"], 
-    accept_multiple_files=True
-)
+uploaded_invoices = st.sidebar.file_uploader("3. Drop Bulk Supporting Customer Invoices Here (PDFs) [Optional]", type=["pdf"], accept_multiple_files=True)
 
 if not (boa_file and zoho_file):
-    st.info("💡 Staging status: Waiting for standard operational bank reports and Zoho transactional data streams.")
+    st.info("💡 Staging status: Waiting for daily bank transactions and matching Zoho payout PDF documentation streams.")
 else:
     # -----------------------------------------------------------------
-    # STEP A: DYNAMIC MEMORY PROCESSING FOR WEB-UPLOADED SUPPORTING INVOICES
+    # FILE EXTRAPOLATION STEP A: READ SYSTEM FILES & WEB UPLOADS
     # -----------------------------------------------------------------
     browser_invoice_registry = {}
     if uploaded_invoices:
@@ -241,7 +242,7 @@ else:
             if meta["invoice_number"] and meta["customer_name"]:
                 browser_invoice_registry[meta["invoice_number"]] = meta["customer_name"]
 
-    # Ingest fallback parsing references
+    # Ingest baseline structural reference maps
     form_master_lookup = {}
     form_paths = ["Form Master DB.xlsx", "Form Master DB.csv", "Form_Master_DB.xlsx", "Form_Master_DB.csv"]
     form_file = next((p for p in form_paths if os.path.exists(p)), None)
@@ -249,7 +250,7 @@ else:
         try:
             f_df = pd.read_csv(form_file) if form_file.endswith('.csv') else pd.read_excel(form_file)
             f_df.columns = [str(c).strip() for c in f_df.columns]
-            term_col = f_df.columns[8] if len(f_df.columns) > 8 else None
+            term_col = f_df.columns[8] if len(f_df.columns) > 8 else None  # Track Column I context
             for c in f_df.columns:
                 if "invoice sent" in c.lower() or "term" in c.lower():
                     term_col = c
@@ -276,6 +277,7 @@ else:
         except Exception:
             pass
 
+    # Load Baseline Masterlist mappings
     master_df = pd.read_csv(MASTERLIST_PATH) if MASTERLIST_PATH.endswith('.csv') else pd.read_excel(MASTERLIST_PATH)
     master_df.columns = [str(col).strip() for col in master_df.columns]
     master_headers_lower = {str(col).lower(): str(col) for col in master_df.columns}
@@ -298,7 +300,7 @@ else:
         )
 
     # -----------------------------------------------------------------
-    # PARSE BANK TRANSACTION ENTRIES
+    # FILE EXTRAPOLATION STEP B: PARSE BANK DATA ROWS
     # -----------------------------------------------------------------
     if boa_file.name.endswith('.csv'):
         raw_bytes = boa_file.read()
@@ -335,10 +337,11 @@ else:
                 source_account=str(row.get(account_target, '')).strip() if account_target else "3371"
             ))
 
+    # Trigger high-fidelity row extraction
     zoho_records = parse_zoho_summary_pdf_bulletproof(zoho_file)
 
     # =====================================================================
-    # 5. GENERAL JOURNAL BALANCING PIPELINE ENGINE
+    # 5. GENERAL JOURNAL PROCESSING & ENTITY CASCADE RESOLUTION ENGINE
     # =====================================================================
     all_journal_lines = []
     diagnostic_logs = []
@@ -354,7 +357,7 @@ else:
             
             # CASCADING SEARCH: Fallback from row description to the active web uploader mapping session cache
             lookup_string = z_rec.description
-            if z_rec.invoice_number in browser_invoice_registry:
+            if z_rec.invoice_number and z_rec.invoice_number in browser_invoice_registry:
                 lookup_string = browser_invoice_registry[z_rec.invoice_number]
                 
             norm_target = normalize_name(lookup_string)
@@ -363,6 +366,7 @@ else:
             best_score = 0.0
             best_candidate = "No Close Matches"
             
+            # Calculate high-accuracy similarity lookups against system master records
             for item in master_lookup.values():
                 s1 = get_match_score(norm_target, item.norm_name)
                 s2 = get_match_score(norm_target, item.norm_ticket) if item.norm_ticket else 0.0
@@ -377,6 +381,7 @@ else:
                     break
 
             if not matched_master_item:
+                # Retention rule: Hold unmapped rows safely inside suspense ledger records
                 account_num = "21040102-B1000002"
                 account_type = "Ledger"
                 account_name = "Temporary Receipt"
@@ -384,9 +389,10 @@ else:
                 desc = f"{lookup_string if lookup_string else 'Unspecified'} (UNRECORDED ENTITY)_{current_boa_description}"
                 
                 diagnostic_logs.append({
-                    "Invoice ID": z_rec.invoice_number if z_rec.invoice_number else "MISSING",
-                    "Resolved Name Evaluated": lookup_string,
-                    "Normalized String": norm_target,
+                    "Row Key Index": z_rec.transaction_key,
+                    "Invoice ID": z_rec.invoice_number if z_rec.invoice_number else "MISSING / EMPTY",
+                    "Description Extracted": z_rec.description,
+                    "Evaluated Label String": lookup_string,
                     "Closest Valid Target Match": f"{best_candidate} ({round(best_score * 100, 1)}%)"
                 })
             else:
@@ -395,6 +401,7 @@ else:
                 account_type = "Customer"
                 account_name = master_item.account_name
                 
+                # Payment term cross-reference resolution sequence
                 lookup_key = normalize_name(account_name)
                 resolved_term = form_master_lookup.get(lookup_key, master_item.payment_term)
                 
@@ -406,7 +413,9 @@ else:
                 prefix = "MPP " if cash_code == "AR002" else ""
                 desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
 
+            # Append Balanced Ledger Layout Entries
             if z_rec.transaction_type == "payment":
+                # Clean Payment Entry
                 all_journal_lines.append({
                     "Date": boa_rec.date, "Voucher": "", "Account name": account_name,
                     "Company": "bwa", "Account type": account_type, "Account": account_num,
@@ -418,6 +427,7 @@ else:
                     "Release date": "", "Reversing entry": "No", "Reversing date": ""
                 })
                 
+                # Split and append associated processing fee
                 if z_rec.merchant_fee > 0:
                     fee_desc = f"Zoho Merchant Fee {account_num} {account_name}_{current_boa_description}"
                     all_journal_lines.append({
@@ -432,6 +442,7 @@ else:
                     })
             
             elif z_rec.transaction_type == "refund":
+                # Post customer refund as an independent debit line item adjustment row
                 refund_desc = f"Refund Line Item Adjustment {account_num} {account_name}_{current_boa_description}"
                 all_journal_lines.append({
                     "Date": boa_rec.date, "Voucher": "", "Account name": account_name,
@@ -444,6 +455,7 @@ else:
                     "Release date": "", "Reversing entry": "No", "Reversing date": ""
                 })
 
+    # Render results to UI
     if all_journal_lines:
         st.success(f"### Compilation Finished: {len(all_journal_lines)} Balanced Rows Prepared For Journal Import.")
         output_df = pd.DataFrame(all_journal_lines, columns=D365_TEMPLATE_COLUMNS)
@@ -463,5 +475,5 @@ else:
     if diagnostic_logs:
         st.markdown("---")
         with st.expander("🚨 🕵️ Unrecorded Description Review Dashboard", expanded=True):
-            st.warning("These transaction rows were safely retained and held in suspense ledger structures.")
+            st.warning("These row elements were safely preserved and held inside suspense ledger allocations.")
             st.dataframe(pd.DataFrame(diagnostic_logs))
