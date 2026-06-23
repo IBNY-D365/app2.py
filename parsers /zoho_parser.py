@@ -44,8 +44,9 @@ class ZohoParser:
             
             # RULE: If a row explicitly has a negative value in the primary data positions, 
             # it is a standalone adjustment/deduction record. We bypass combining here.
-            if '-' in raw_gross_str or '-' in raw_fee_str:
-                continue
+            # payment row records.append(ZohoRecord(customer_name=c_name, gross_amount=gross, merchant_fee=fee, invoice_number=inv, transaction_type="payment"))
+
+            # refund row records.append(ZohoRecord(customer_name=c_name, refund_amount=refund, invoice_number=inv, transaction_type="refund"))
                 
             gross = clean_numeric_value(row[gross_col]) if gross_col else 0.0
             fee = clean_numeric_value(row[fee_col]) if fee_col else 0.0
