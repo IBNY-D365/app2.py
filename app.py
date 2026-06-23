@@ -76,13 +76,14 @@ def clean_numeric_value(val: Any) -> float:
         return 0.0
 
 def normalize_name(name: str) -> str:
-    """Removes LLC, INC, spaces, and punctuation to guarantee exact cross-matching."""
+    """Removes LLC, INC, and aggressively strips ALL non-alphanumeric characters (including invisible PDF unicode)."""
     if not name or pd.isna(name):
         return ""
     n = str(name).lower()
-    n = re.sub(r'[,.\-&]', ' ', n)
+    # Remove business entity suffixes
     n = re.sub(r'\b(inc|llc|corp|ltd|incorporated|company|co|pllc)\b', '', n)
-    n = re.sub(r'\s+', '', n)
+    # DESTROY ALL spaces, punctuation, dashes, and invisible web characters
+    n = re.sub(r'[^a-z0-9]', '', n)
     return n
 
 # =====================================================================
