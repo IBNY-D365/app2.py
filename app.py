@@ -129,7 +129,7 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
         if cust_match:
             result["customer_name"] = cust_match.group(1).strip()
             
-        bill_to_match = re.search(r"Bill\s+To[\s\:]*([A-Za-z0-9\s\.\,\-]+?)(?:\s*\d|\s*Ship\s*To|$)", full_text_clean, re.IGNORECASE)
+        bill_to_match = re.search(r"Bill\s+To\s*(.*?)\s*Ship\s+To",full_text_clean,re.IGNORECASE | re.DOTALL)
         if bill_to_match:
             result["fallback_personal_name"] = bill_to_match.group(1).strip()
             if not result["customer_name"]:
