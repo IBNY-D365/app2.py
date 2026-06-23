@@ -1,143 +1,124 @@
 import pandas as pd
-from typing import List, Dict, Any
-from core.models import ProcessingBatch, BOARecord, ZohoRecord, AccountMasterItem
-from core.validators import EngineValidator
-from config.mappings import CASH_CODE_MAPPING, OFFSET_ACCOUNT_ROUTING, D365_TEMPLATE_COLUMNS
+from pypdf import PdfReader
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+import re
+import streamlit as st
 
-class D365AutomationEngine:
-    def __init__(self, masterlist_path: str):
-        self.masterlist = self._load_masterlist(masterlist_path)
+# =====================================================================
+# DATA UTILITIES & MODELS
+# =====================================================================
+class ZohoRecord(BaseModel):
+    customer_name: Optional[str] = None
+    gross_amount: float
+    merchant_fee: float
+    invoice_number: Optional[str] = None
+    fallback_personal_name: Optional[str] = None
 
-    def _load_masterlist(self, path: str) -> Dict[str, AccountMasterItem]:
-        df = pd.read_excel(path)
-        master_dict = {}
-        for _, row in df.iterrows():
-            name_key = str(row['Account Name']).strip().lower()
-            master_dict[name_key] = AccountMasterItem(
-                account_number=str(row['Account #']),
-                account_name=str(row['Account Name']),
-                payment_term=str(row.get('Payment Term', 'due-on-receipt')).strip().lower()
-            )
-        return master_dict
+def clean_numeric_value(val: Any) -> float:
+    if pd.isna(val) or val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    cleaned_str = str(val).strip().replace('$', '').replace(',', '')
+    try:
+        return float(cleaned_str)
+    except ValueError:
+        return 0.0
 
-    def resolve_account(self, name: str) -> AccountMasterItem:
-        """Rule 3.2: String Normalization and master list lookup logic."""
-        if not name:
-            raise ValueError("Missing customer identifier name.")
-        key = name.strip().lower()
-        if key in self.masterlist:
-            return self.masterlist[key]
-        raise ValueError(f"Customer '{name}' not found inside Account Masterlist reference.")
-
-    def process_transaction_group(self, boa_rec: BOARecord, zoho_recs: List[ZohoRecord]) -> tuple[List[Dict[str, Any]], List[str]]:
-        batch = ProcessingBatch(boa_record=boa_rec, zoho_records=zoho_recs)
-        errors = EngineValidator.validate_batch_invariants(batch)
+# =====================================================================
+# ADVANCED EXTRACTION ENGINE
+# =====================================================================
+def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
+    """Scans individual invoices to capture the precise Paid Amount and business entity."""
+    result = {"customer_name": None, "invoice_number": None, "gross_amount": 0.0, "fallback_personal_name": None}
+    try:
+        reader = PdfReader(pdf_file)
+        full_text = ""
+        for page in reader.pages:
+            full_text += page.extract_text() or ""
+            
+        full_text_clean = " ".join(full_text.split())
         
-        if errors:
-            return [], errors
-
-        journal_lines = []
-        processed_accounts = []
-        total_grouped_fee = 0.0
+        # 1. Invoice Number Extraction
+        inv_num = pdf_file.name.replace(".pdf", "")
+        inv_match = re.search(r"(INV-[A-Za-z0-9\-]+)", full_text_clean, re.IGNORECASE)
+        result["invoice_number"] = inv_match.group(1).strip() if inv_match else inv_num
         
-        offset_acct = OFFSET_ACCOUNT_ROUTING.get(boa_rec.source_account, "")
-        if not offset_acct:
-            errors.append(f"Invalid BOA Source Account Routing code: {boa_rec.source_account}")
-            return [], errors
-
-        # -------------------------------------------------------------
-        # STEP 1: CREDIT LINE GENERATION (Customer Payment Segment)
-        # -------------------------------------------------------------
-        for z_rec in zoho_recs:
-            try:
-                master_item = self.resolve_account(z_rec.customer_name)
-            except ValueError as e:
-                errors.append(str(e))
-                continue
-                
-            processed_accounts.append(master_item)
-            total_grouped_fee += z_rec.merchant_fee
-            
-            # Cash Code determination pipeline
-            term_info = CASH_CODE_MAPPING.get(master_item.payment_term, CASH_CODE_MAPPING['fallback'])
-            cash_code = term_info[0]
-            
-            # Prefix execution check
-            prefix = "MPP " if cash_code == "AR002" else ""
-            desc = f"{prefix}{master_item.account_number} {master_item.account_name}_{boa_rec.description}"
-            
-            credit_line = {
-                "Date": boa_rec.date,
-                "Voucher": "",  # Rule: Leave BLANK
-                "Account name": master_item.account_name,
-                "Company": "bwa",
-                "Account type": "Customer",
-                "Account": master_item.account_number,
-                "Posting Profile": "AutoPost",
-                "Cash code": cash_code,
-                "Description": desc,
-                "Debit": "",
-                "Credit": z_rec.gross_amount,
-                "Item sales tax group": "",
-                "Sales tax code": "",
-                "Offset company": "bwa",
-                "Bank Account Type": "Bank",
-                "Offset account": offset_acct,
-                "Offset transaction text": "",
-                "Currency": "USD",
-                "Exchange rate": 1.00,
-                "Item sales tax group2": "",
-                "Sales tax group": "AVATAX",
-                "Withholding tax group": "",
-                "Release date": "",
-                "Reversing entry": "No",
-                "Reversing date": ""
-            }
-            journal_lines.append(credit_line)
-
-        if errors:
-            return [], errors
-
-        # -------------------------------------------------------------
-        # STEP 2: DEBIT LINE GENERATION (Zoho Merchant Fee Segment)
-        # -------------------------------------------------------------
-        if total_grouped_fee > 0:
-            # Rule 3.3: Dynamic concatenation handling for Single vs Multi-Payment context strings
-            if len(processed_accounts) == 1:
-                acc = processed_accounts[0]
-                fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{boa_rec.description}"
+        # 2. Gross Amount Extraction
+        pm_match = re.search(r"Payment\s*Made[^\d\$]*\$?([0-9,]+\.\d{2})", full_text_clean, re.IGNORECASE)
+        if pm_match:
+            result["gross_amount"] = clean_numeric_value(pm_match.group(1))
+        else:
+            totals = re.findall(r"Total[^\d\$]*\$?([0-9,]+\.\d{2})", full_text_clean, re.IGNORECASE)
+            if totals:
+                result["gross_amount"] = clean_numeric_value(totals[-1])
             else:
-                account_strings = ", ".join([f"{a.account_number} {a.account_name}" for a in processed_accounts])
-                fee_desc = f"Zoho Merchant Fee {account_strings}_{boa_rec.description}"
+                all_decimals = [clean_numeric_value(n) for n in re.findall(r"\b\d+(?:,\d{3})*\.\d{2}\b", full_text_clean)]
+                result["gross_amount"] = max(all_decimals) if all_decimals else 0.0
+        
+        # 3. Aggressive Name Extraction (Looks for Bill To, Customer Name, or just To:)
+        bill_to_match = re.search(r"(?:Bill\s*To|Customer\s*Name|To)[\s\:]+([A-Za-z0-9\s\.\,\&\-]+?)(?:\s+(?:Invoice|Date|Amount|Terms|Ship|Receipt|Total|[\$\d]))", full_text_clean, re.IGNORECASE)
+        if bill_to_match:
+            candidate = bill_to_match.group(1).strip()
+            if len(candidate) > 3:
+                result["customer_name"] = candidate
+                result["fallback_personal_name"] = candidate
                 
-            debit_line = {
-                "Date": boa_rec.date,
-                "Voucher": "",
-                "Account name": "Outside Service (Finance)",
-                "Company": "bwa",
-                "Account type": "Ledger",
-                "Account": "43170111-U26C05001-B735350-UOA003",
-                "Posting Profile": "",
-                "Cash code": "OSF005",
-                "Description": fee_desc,
-                "Debit": total_grouped_fee,
-                "Credit": "",
-                "Item sales tax group": "",
-                "Sales tax code": "",
-                "Offset company": "bwa",
-                "Bank Account Type": "Bank",
-                "Offset account": offset_acct,
-                "Offset transaction text": "",
-                "Currency": "USD",
-                "Exchange rate": 1.00,
-                "Item sales tax group2": "",
-                "Sales tax group": "AVATAX",
-                "Withholding tax group": "",
-                "Release date": "",
-                "Reversing entry": "No",
-                "Reversing date": ""
-            }
-            journal_lines.append(debit_line)
+        # 4. Deep Target Search Fallback
+        if not result["customer_name"]:
+            biz_matches = re.findall(r"InBody\d*\s*-\s*[^-]+?-\s*([A-Za-z0-9\s\.\,\&]+)", full_text_clean, re.IGNORECASE)
+            for match in biz_matches:
+                candidate = re.sub(r'\d+\.\d{2}.*', '', match).strip()
+                if candidate and not any(k in candidate.lower() for k in ["malfunction", "check required", "sku", "labor", "board", "cable", "loaner"]):
+                    result["customer_name"] = candidate
+                    break
+                    
+    except Exception as e:
+        st.error(f"Error executing intelligent metadata capture: {e}")
+    return result
 
-        return journal_lines, errors
-
+def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
+    """Isolates the name by scanning horizontally across the entire PDF blob."""
+    records = []
+    try:
+        reader = PdfReader(pdf_file)
+        full_text = ""
+        for page in reader.pages:
+            full_text += page.extract_text() or ""
+            
+        # Squashes the entire PDF into one massive block of text to defeat line-break formatting issues
+        flat_text = full_text.replace('\n', ' ')
+        
+        # AGGRESSIVE SEARCH PATTERN:
+        # Finds [INV-XXXX] + [Any Words Trapped in the Middle] + [First Money Amount]
+        pattern = re.compile(r"(INV-[A-Za-z0-9\-]+)\s+([A-Za-z0-9\s\.\,\&\-]+?)\s+\$?([0-9,]+\.\d{2})")
+        matches = pattern.finditer(flat_text)
+        
+        for match in matches:
+            inv_id = match.group(1).upper()
+            raw_name = match.group(2).strip()
+            gross_str = match.group(3)
+            
+            # Clean up the extracted name (Strips out accidental dates like 06/10/2026 that snuck in)
+            clean_name = re.sub(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', '', raw_name)
+            clean_name = re.sub(r'\s+', ' ', clean_name).strip()
+            
+            gross = clean_numeric_value(gross_str)
+            
+            # Look ahead for the fee (next 50 characters)
+            lookahead = flat_text[match.end():match.end()+50]
+            fee_matches = re.findall(r"[-+]?[0-9,]+\.\d{2}", lookahead)
+            fee = abs(clean_numeric_value(fee_matches[0])) if fee_matches else 0.0
+            
+            if gross > 0 and not any(r.invoice_number == inv_id for r in records):
+                records.append(ZohoRecord(
+                    customer_name=clean_name if len(clean_name) > 3 else None,
+                    gross_amount=gross,
+                    merchant_fee=fee,
+                    invoice_number=inv_id
+                ))
+                
+    except Exception as e:
+        st.error(f"Error executing summary parser: {e}")
+    return records
