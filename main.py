@@ -55,7 +55,7 @@ if __name__ == "__main__":
     run_pipeline(
         boa_file="data/input/boa_report.csv",
         zoho_file="data/input/zoho_payments.xlsx",
-        masterlist_file="data/reference/Account_Masterlist.xlsx",
         invoice_dir="data/input/invoices/",
+        masterlist_file="data/reference/Account_Masterlist.xlsx",
         output_path="data/output/D365_General_Journal_Import.xlsx"
     )
