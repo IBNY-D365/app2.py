@@ -26,7 +26,7 @@ import os
 import difflib
 import tempfile
 
-from mappings import CASH_CODE_MAPPING, OFFSET_ACCOUNT_ROUTING, D365_TEMPLATE_COLUMNS
+from config.mappings import CASH_CODE_MAPPING, OFFSET_ACCOUNT_ROUTING, D365_TEMPLATE_COLUMNS
 from core.models import BOARecord, ZohoRecord, AccountMasterItem
 from parsers.invoice_parser import extract_invoice_metadata_intelligent, parse_zoho_summary_pdf_bulletproof
 from core.validators import normalize_name, get_match_score
