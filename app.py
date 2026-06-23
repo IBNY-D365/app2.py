@@ -7,6 +7,7 @@ from datetime import datetime
 import re
 import io
 import os
+import difflib # NEW: Added for Human-like Fuzzy Matching
 
 # =====================================================================
 # 1. HARDCODED CONFIGURATIONS & MAPPINGS
@@ -84,6 +85,17 @@ def normalize_name(name: str) -> str:
     n = re.sub(r'[^a-z0-9]', '', n)
     return n
 
+def get_match_score(target: str, candidate: str) -> float:
+    """Calculates a mathematical similarity percentage between two names."""
+    if not target or not candidate: 
+        return 0.0
+    if target == candidate: 
+        return 1.0
+    if len(target) >= 5 and (target in candidate or candidate in target): 
+        return 1.0
+    # Returns a decimal score (e.g. 0.88) based on character similarity 
+    return difflib.SequenceMatcher(None, target, candidate).ratio()
+
 # =====================================================================
 # 3. ADVANCED EXTRACTION ENGINE
 # =====================================================================
@@ -98,12 +110,10 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
             
         full_text_clean = " ".join(full_text.split())
         
-        # 1. Invoice Number Extraction
         inv_num = pdf_file.name.replace(".pdf", "")
         inv_match = re.search(r"(INV-\d+)", full_text_clean, re.IGNORECASE)
         result["invoice_number"] = inv_match.group(1).strip() if inv_match else inv_num
         
-        # 2. Source of Truth Gross Amount Extraction
         pm_match = re.search(r"Payment\s*Made[^\d\$]*\$?([0-9,]+\.\d{2})", full_text_clean, re.IGNORECASE)
         if pm_match:
             result["gross_amount"] = clean_numeric_value(pm_match.group(1))
@@ -115,12 +125,11 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
                 all_decimals = [clean_numeric_value(n) for n in re.findall(r"\b\d+(?:,\d{3})*\.\d{2}\b", full_text_clean)]
                 result["gross_amount"] = max(all_decimals) if all_decimals else 0.0
         
-        # 3. Robust Customer Name Extraction
         cust_match = re.search(r"Customer\s*Name[\s\:]*([A-Za-z0-9\s\.\,\&\-]+?)(?:\s+(?:Invoice|Date|Amount|Terms|Bill\s*To|Ship\s*To|$))", full_text_clean, re.IGNORECASE)
         if cust_match:
             result["customer_name"] = cust_match.group(1).strip()
             
-        bill_to_match = re.search(r"Bill\s+To\s*([A-Za-z0-9\s\.\,\-]+?)(?:\s*\d|\s*Ship\s*To|$)", full_text_clean, re.IGNORECASE)
+        bill_to_match = re.search(r"Bill\s+To[\s\:]*([A-Za-z0-9\s\.\,\-]+?)(?:\s*\d|\s*Ship\s*To|$)", full_text_clean, re.IGNORECASE)
         if bill_to_match:
             result["fallback_personal_name"] = bill_to_match.group(1).strip()
             if not result["customer_name"]:
@@ -139,7 +148,7 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
     return result
 
 def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
-    """Now effectively extracts the string Customer Name from the raw PDF text."""
+    """Isolates the name by mathematically stripping all numbers from the PDF line."""
     records = []
     try:
         reader = PdfReader(pdf_file)
@@ -147,7 +156,6 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
         for page in reader.pages:
             full_text += page.extract_text() or ""
             
-        # Parse line by line to preserve spacing context for the business name
         for line in full_text.split('\n'):
             if "INV-" in line.upper():
                 inv_match = re.search(r"(INV-[A-Za-z0-9\-]+)", line, re.IGNORECASE)
@@ -155,20 +163,25 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
                     continue
                 inv_id = inv_match.group(1).upper()
                 
-                amounts = re.findall(r"\b\d+(?:,\d{3})*\.\d{2}\b", line)
+                after_inv_text = line[inv_match.end():]
+                amounts = re.findall(r"[-+]?[0-9,]+\.\d{2}", after_inv_text)
                 if not amounts:
                     continue
                     
-                gross = clean_numeric_value(amounts[0])
-                fee = clean_numeric_value(amounts[1]) if len(amounts) > 1 else 0.0
+                float_amounts = [abs(clean_numeric_value(a)) for a in amounts]
+                if len(float_amounts) >= 2:
+                    gross = max(float_amounts)
+                    fee = min(float_amounts)
+                elif len(float_amounts) == 1:
+                    gross = float_amounts[0]
+                    fee = 0.0
                 
-                # Slices the text strictly between the INV tag and the first money amount
-                after_inv = line[inv_match.end():]
-                amount_match = re.search(r"\b\d+(?:,\d{3})*\.\d{2}\b", after_inv)
-                cust_name = None
-                
-                if amount_match:
-                    cust_name = after_inv[:amount_match.start()].replace('$', '').strip()
+                # PURIFIER: Delete all money numbers from the line to perfectly isolate the pure text name
+                name_candidate = after_inv_text
+                for amt in amounts:
+                    name_candidate = name_candidate.replace(amt, '')
+                    
+                cust_name = name_candidate.replace('$', '').replace(',', '').strip()
                 
                 if gross > 0 and not any(r.invoice_number == inv_id for r in records):
                     records.append(ZohoRecord(
@@ -393,21 +406,27 @@ else:
             norm_per = normalize_name(z_rec.fallback_personal_name)
             
             matched_master_item = None
+            best_score = 0.0
+            best_candidate = "No Close Matches"
             
+            # CORE FIX: The AI Fuzzy Matching Loop
             for item in master_lookup.values():
-                if norm_biz and (norm_biz == item.norm_name or (len(norm_biz) >= 5 and (norm_biz in item.norm_name or item.norm_name in norm_biz))):
+                s1 = get_match_score(norm_biz, item.norm_name)
+                s2 = get_match_score(norm_per, item.norm_name)
+                s3 = get_match_score(norm_biz, item.norm_ticket) if item.norm_ticket else 0.0
+                s4 = get_match_score(norm_per, item.norm_ticket) if item.norm_ticket else 0.0
+                
+                highest_sim_score = max(s1, s2, s3, s4)
+                
+                # Keep track of the closest match for the debugger
+                if highest_sim_score > best_score:
+                    best_score = highest_sim_score
+                    best_candidate = item.account_name
+                
+                # If similarity is 85% or higher, count it as an exact match!
+                if highest_sim_score >= 0.85:
                     matched_master_item = item
                     break
-                if norm_per and (norm_per == item.norm_name or (len(norm_per) >= 5 and (norm_per in item.norm_name or item.norm_name in norm_per))):
-                    matched_master_item = item
-                    break
-                if item.norm_ticket:
-                    if norm_per and (norm_per == item.norm_ticket or (len(norm_per) >= 5 and (norm_per in item.norm_ticket or item.norm_ticket in norm_per))):
-                        matched_master_item = item
-                        break
-                    if norm_biz and (norm_biz == item.norm_ticket or (len(norm_biz) >= 5 and (norm_biz in item.norm_ticket or item.norm_ticket in norm_biz))):
-                        matched_master_item = item
-                        break
 
             if not matched_master_item:
                 account_num = "21040102-B1000002"
@@ -418,10 +437,12 @@ else:
                 display_label = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "Unknown")
                 desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
                 
+                # Upgraded Diagnostic Logger
                 diagnostic_logs.append({
                     "Invoice": z_rec.invoice_number,
-                    "Raw Name Read from PDF": z_rec.customer_name,
-                    "Engine's Normalized Target": norm_biz,
+                    "Raw Name Extracted": z_rec.customer_name,
+                    "Engine's Target": norm_biz,
+                    "Closest Masterlist Match": f"{best_candidate} ({round(best_score * 100, 1)}% Similarity)"
                 })
             else:
                 master_item = matched_master_item
@@ -497,9 +518,5 @@ else:
     if diagnostic_logs:
         st.markdown("---")
         with st.expander("🚨 🕵️ Unmatched Entities Debugger (Click Here)", expanded=True):
-            st.error("**Why are these showing as Temporary Receipt?** \nThe engine stripped out all formatting and generated the text under **'Engine's Normalized Target'** below. It could not find that exact string anywhere in your Masterlist. Check if extra data (like emails or dates) accidentally got pulled into the name.")
+            st.error("**Why are these showing as Temporary Receipt?** \nThe AI couldn't find a strong enough match (requires 85% similarity). Look at the 'Closest Masterlist Match' column below to see what it almost matched with. If the score is low, verify the Masterlist has the correct spelling.")
             st.dataframe(pd.DataFrame(diagnostic_logs))
-            
-            st.warning("**Here is what your Masterlist looks like to the Engine:**")
-            debug_master = [{"Account": m.account_name, "Normalized Master Target": m.norm_name} for m in list(master_lookup.values())]
-            st.dataframe(pd.DataFrame(debug_master))
