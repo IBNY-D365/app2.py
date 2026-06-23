@@ -1,9 +1,36 @@
 import sys
 from pathlib import Path
+import types
+import importlib.util
 
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
+
+def _ensure_pkg(name: str) -> None:
+    if name not in sys.modules:
+        pkg = types.ModuleType(name)
+        pkg.__path__ = [str(BASE_DIR / name)]
+        sys.modules[name] = pkg
+
+def _load_module(module_name: str, relative_path: str):
+    module_path = BASE_DIR / relative_path
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load {module_name} from {module_path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+_ensure_pkg("config")
+_ensure_pkg("core")
+_ensure_pkg("parsers")
+
+mappings = _load_module("config.mappings", "config/mappings.py")
+models = _load_module("core.models", "core/models.py")
+validators = _load_module("core.validators", "core/validators.py")
+invoice_parser = _load_module("parsers.invoice_parser", "parsers/invoice_parser.py")
 
 import streamlit as st
 import pandas as pd
@@ -17,11 +44,19 @@ import os
 import difflib
 import tempfile
 
-from config.mappings import CASH_CODE_MAPPING, OFFSET_ACCOUNT_ROUTING, D365_TEMPLATE_COLUMNS
-from core.models import BOARecord, ZohoRecord, AccountMasterItem
-from parsers.invoice_parser import extract_invoice_metadata_intelligent, parse_zoho_summary_pdf_bulletproof
-from core.validators import normalize_name, get_match_score
+CASH_CODE_MAPPING = mappings.CASH_CODE_MAPPING
+OFFSET_ACCOUNT_ROUTING = mappings.OFFSET_ACCOUNT_ROUTING
+D365_TEMPLATE_COLUMNS = mappings.D365_TEMPLATE_COLUMNS
 
+BOARecord = models.BOARecord
+ZohoRecord = models.ZohoRecord
+AccountMasterItem = models.AccountMasterItem
+
+extract_invoice_metadata_intelligent = invoice_parser.extract_invoice_metadata_intelligent
+parse_zoho_summary_pdf_bulletproof = invoice_parser.parse_zoho_summary_pdf_bulletproof
+
+normalize_name = validators.normalize_name
+get_match_score = validators.get_match_score
 
 # --------------------------------------------------
 # Helpers
