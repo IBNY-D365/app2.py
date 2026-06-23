@@ -205,13 +205,20 @@ else:
         if not matched_zoho:
             continue
 
-        total_gross = sum(z.gross_amount for z in matched_zoho)
-        total_fees = round(total_gross - boa_rec.net_amount, 2)
-        
-        if len(matched_zoho) >= 1:
-            each_fee = round(total_fees / len(matched_zoho), 2)
-            for z in matched_zoho:
-                z.merchant_fee = each_fee
+        payment_records = [z for z in zoho_records if z.transaction_type == "payment"]
+        refund_records = [z for z in zoho_records if z.transaction_type == "refund"]
+
+        total_fees = round(sum(z.merchant_fee for z in payment_records), 2)
+        total_refunds = round(sum(z.refund_amount for z in refund_records), 2)
+        total_gross = round(sum(z.gross_amount for z in payment_records), 2)
+
+        calculated_net = round(total_gross - total_fees - total_refunds, 2)
+
+if abs(calculated_net - boa_rec.net_amount) > 0.01:
+    validation_errors.append(
+        f"🚨 Reconciliation mismatch: expected {calculated_net}, bank shows {boa_rec.net_amount}"
+    )
+    continue
 
         if total_gross == 0:
             validation_errors.append("⚠️ **Data Ingestion Alert:** Gross totals returned zero balance calculations.")
