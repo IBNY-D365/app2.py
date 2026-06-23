@@ -164,4 +164,178 @@ else:
         inv_col = next((c for c in zoho_df.columns if 'invoice' in c.lower()), None)
         
         for _, row in zoho_df.iterrows():
-            cleaned_gross = str(row.get(gross_col, 0.0)).strip().replace('$', '').replace(',',
+            cleaned_gross = str(row.get(gross_col, 0.0)).strip().replace('$', '').replace(',', '')
+            cleaned_fee = str(row.get(fee_col, 0.0)).strip().replace('$', '').replace(',', '')
+            raw_zoho_pool.append(ZohoRecord(
+                customer_name=str(row[cust_col]).strip() if cust_col and pd.notna(row[cust_col]) else None,
+                gross_amount=float(cleaned_gross) if cleaned_gross else 0.0,
+                merchant_fee=float(cleaned_fee) if cleaned_fee else 0.0,
+                invoice_number=str(row[inv_col]).strip() if inv_col and pd.notna(row[inv_col]) else None
+            ))
+
+    zoho_deduped_dict = {}
+    for r in raw_zoho_pool:
+        if r.invoice_number:
+            zoho_deduped_dict[r.invoice_number] = r
+            
+    for inv_rec in invoice_sources_list:
+        if inv_rec.invoice_number:
+            if inv_rec.invoice_number in zoho_deduped_dict:
+                existing = zoho_deduped_dict[inv_rec.invoice_number]
+                if not existing.customer_name and inv_rec.customer_name:
+                    existing.customer_name = inv_rec.customer_name
+                if not existing.fallback_personal_name and inv_rec.fallback_personal_name:
+                    existing.fallback_personal_name = inv_rec.fallback_personal_name
+                if inv_rec.gross_amount > 0:
+                    existing.gross_amount = inv_rec.gross_amount
+            else:
+                zoho_deduped_dict[inv_rec.invoice_number] = inv_rec
+                
+    zoho_records = list(zoho_deduped_dict.values())
+
+    # =====================================================================
+    # STEP E: TRANSACTION MATCHING ENGINE
+    # =====================================================================
+    all_journal_lines = []
+    validation_errors = []
+    diagnostic_logs = []
+
+    for boa_rec in boa_records:
+        matched_zoho = [z for z in zoho_records if z.gross_amount > 0]
+        if not matched_zoho:
+            continue
+
+        total_gross = sum(z.gross_amount for z in matched_zoho)
+        total_fees = round(total_gross - boa_rec.net_amount, 2)
+        
+        if len(matched_zoho) >= 1:
+            each_fee = round(total_fees / len(matched_zoho), 2)
+            for z in matched_zoho:
+                z.merchant_fee = each_fee
+
+        if total_gross == 0:
+            validation_errors.append("⚠️ **Data Ingestion Alert:** Gross totals returned zero balance calculations.")
+            continue
+            
+        if total_fees < 0:
+            validation_errors.append(f"🚨 **Mathematical Balance Discrepancy!** Bank Net ledger holds higher metrics than source records.")
+            continue
+
+        offset_acct = OFFSET_ACCOUNT_ROUTING.get(boa_rec.source_account, "B1000002")
+        processed_accounts = []
+        
+        for z_rec in matched_zoho:
+            current_boa_description = str(boa_rec.description)
+            
+            norm_biz = normalize_name(z_rec.customer_name)
+            norm_per = normalize_name(z_rec.fallback_personal_name)
+            
+            matched_master_item = None
+            best_score = 0.0
+            best_candidate = "No Close Matches"
+            
+            # CORE FIX LOGIC: Running the AI Fuzzy Similarity Matrix checking routines
+            for item in master_lookup.values():
+                s1 = get_match_score(norm_biz, item.norm_name)
+                s2 = get_match_score(norm_per, item.norm_name)
+                s3 = get_match_score(norm_biz, item.norm_ticket) if item.norm_ticket else 0.0
+                s4 = get_match_score(norm_per, item.norm_ticket) if item.norm_ticket else 0.0
+                
+                highest_sim_score = max(s1, s2, s3, s4)
+                
+                if highest_sim_score > best_score:
+                    best_score = highest_sim_score
+                    best_candidate = item.account_name
+                
+                if highest_sim_score >= 0.85:
+                    matched_master_item = item
+                    break
+
+            if not matched_master_item:
+                account_num = "21040102-B1000002"
+                account_type = "Ledger"
+                account_name = "Temporary Receipt"
+                cash_code = "AR012"
+                
+                display_label = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "Unknown")
+                desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
+                
+                diagnostic_logs.append({
+                    "Invoice": z_rec.invoice_number,
+                    "Raw Name Extracted": z_rec.customer_name,
+                    "Engine's Target": norm_biz,
+                    "Closest Masterlist Match": f"{best_candidate} ({round(best_score * 100, 1)}% Similarity)"
+                })
+            else:
+                master_item = matched_master_item
+                processed_accounts.append(master_item)
+                
+                term_info = CASH_CODE_MAPPING.get(master_item.payment_term, CASH_CODE_MAPPING['fallback'])
+                cash_code = term_info[0]
+                prefix = "MPP " if cash_code == "AR002" else ""
+                
+                account_num = master_item.account_number
+                account_type = "Customer"
+                account_name = master_item.account_name
+                desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
+            
+            all_journal_lines.append({
+                "Date": boa_rec.date, "Voucher": "", "Account name": account_name,
+                "Company": "bwa", "Account type": account_type, "Account": account_num,
+                "Posting Profile": "AutoPost" if account_type == "Customer" else "", "Cash code": cash_code, "Description": desc,
+                "Debit": "", "Credit": z_rec.gross_amount, "Item sales tax group": "", "Sales tax code": "",
+                "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
+                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "",
+                "Release date": "", "Reversing entry": "No", "Reversing date": ""
+            })
+
+        if total_fees > 0:
+            current_boa_description = str(boa_rec.description)
+            if len(processed_accounts) == 1:
+                acc = processed_accounts[0]
+                fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{current_boa_description}"
+            elif len(processed_accounts) > 1:
+                account_strings = ", ".join([f"{a.account_number} {a.account_name}" for a in processed_accounts])
+                fee_desc = f"Zoho Merchant Fee {account_strings}_{current_boa_description}"
+            else:
+                fee_desc = f"Zoho Merchant Fee (Unresolved Suspense Pool Batch)_{current_boa_description}"
+
+            all_journal_lines.append({
+                "Date": boa_rec.date, "Voucher": "", "Account name": "Outside Service (Finance)",
+                "Company": "bwa", "Account type": "Ledger", "Account": "43170111-U26C05001-B735350-UOA003",
+                "Posting Profile": "", "Cash code": "OSF005", "Description": fee_desc,
+                "Debit": total_fees, "Credit": "", "Item sales tax group": "", "Sales tax code": "",
+                "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
+                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "",
+                "Release date": "", "Reversing entry": "No", "Reversing date": ""
+            })
+
+    # STEP F: DATA RENDERING AND DISTRIBUTION PLATFORM
+    if validation_errors:
+        st.error("### Pipeline Validation Discrepancies Checked")
+        for error in validation_errors:
+            st.markdown(error)
+
+    if all_journal_lines:
+        st.success(f"### Transformed {len(all_journal_lines)} Journal Lines Successfully!")
+        output_df = pd.DataFrame(all_journal_lines, columns=D365_TEMPLATE_COLUMNS)
+        st.dataframe(output_df)
+        
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            output_df.to_excel(writer, index=False, sheet_name="Journal Lines")
+        
+        st.download_button(
+            label="📥 Download Generated D365 Journal Import Sheet",
+            data=buffer.getvalue(),
+            file_name="D365_General_Journal_Import.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        
+    if diagnostic_logs:
+        st.markdown("---")
+        with st.expander("🚨 🕵️ Unmatched Entities Debugger (Click Here)", expanded=True):
+            st.error("The automated parsing core could not locate high percentage similarities inside database mappings.")
+            st.dataframe(pd.DataFrame(diagnostic_logs))
