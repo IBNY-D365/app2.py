@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import date
 
+
 class BOARecord(BaseModel):
     date: date
     description: str
@@ -29,6 +30,8 @@ class AccountMasterItem(BaseModel):
     account_number: str
     account_name: str
     payment_term: str
+    norm_name: str = ""
+    norm_ticket: str = ""
 
 
 class ProcessingBatch(BaseModel):
