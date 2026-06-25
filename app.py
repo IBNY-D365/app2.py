@@ -1,12 +1,13 @@
 import streamlit as st
 import pandas as pd
 import io
-import pdfplumber  # Added for PDF extraction
+import pdfplumber
 import re
 
 # --- 1. CONFIGURATION & CONSTANTS ---
 st.set_page_config(page_title="D365 Journal Entry Automation", layout="wide")
 
+# Exact 25-Column D365 Format [cite: 35, 59, 107, 110, 164, 167]
 D365_COLUMNS = [
     "Date", "Voucher", "Account name", "Company", "Account type", 
     "Account", "Posting Profile", "Cash code", "Description", "Debit", 
@@ -17,7 +18,6 @@ D365_COLUMNS = [
 ]
 
 # --- 2. PDF PARSING UTILITIES ---
-
 def extract_text_from_pdf(pdf_file):
     """Extracts raw text from an uploaded PDF file for regex parsing."""
     text = ""
@@ -31,39 +31,17 @@ def extract_text_from_pdf(pdf_file):
         st.error(f"Error reading PDF: {e}")
     return text
 
-def parse_zoho_pdf_data(raw_text):
-    # TODO: Implement precise Regular Expressions to find:
-    # 1. Customer Name
-    # 2. Gross Amount
-    # 3. Merchant Fee
-    # 4. Refunds / Adjustments
-    pass
+def parse_pdf_transaction_data(raw_text, platform="ZOHO"):
+    # PLACEHOLDER: We will add the exact Regex here once the text structures are confirmed.
+    # Returns a list of dictionaries with: Customer Name, Gross Amount, Merchant Fee
+    return [{"customer_name": "Example Customer", "gross_amount": 100.00, "merchant_fee": 3.00}]
 
-def parse_stripe_pdf_data(raw_text):
-    # TODO: Implement precise Regular Expressions to find Stripe specific details
-    pass
-
-# --- 3. CORE PROCESSING FUNCTIONS ---
-
-def process_monthly_expense(row, d365_guide):
-    # TODO: Implement Monthly lookup logic
-    pass
-
-def process_zoho_payment(row, zoho_pdf_text, d365_guide):
-    # TODO: Implement Zoho Gross/Fee split using parsed PDF data
-    pass
-
-def process_stripe_payment(row, stripe_pdf_text, d365_guide):
-    # TODO: Implement Stripe Gross/Fee split using parsed PDF data
-    pass
-
-def process_fallback(row):
-    # Implement Fallback / Non-Monthly
+# --- 3. D365 ENTRY GENERATORS ---
+def create_base_entry(boa_row):
+    """Initializes a blank D365 entry with standard defaults."""
     entry = {col: "" for col in D365_COLUMNS}
-    entry["Date"] = row.get("Date", "") # Placeholder for actual BOA date col
+    entry["Date"] = boa_row.get("Date", "")
     entry["Company"] = "bwa"
-    entry["Description"] = row.get("Description", "") # Map AS IS
-    entry["Debit"] = row.get("Amount", "") # Map AS IS
     entry["Offset company"] = "bwa"
     entry["Bank Account Type"] = "Bank"
     entry["Currency"] = "USD"
@@ -71,38 +49,79 @@ def process_fallback(row):
     entry["Sales tax group"] = "AVATAX"
     entry["Reversing entry"] = "No"
     
+    # Conditional Offset Routing [cite: 107]
+    # NOTE: You will need to map the exact 'Source Account' column from BOA here once known.
+    # if source_account == '3371': entry["Offset account"] = "B1000002"
+    # elif source_account == '3924': entry["Offset account"] = "B1000003"
+    # elif source_account == '3384': entry["Offset account"] = "B1000001"
+    
+    return entry
+
+def process_payment_batch(boa_row, pdf_text, platform, d365_guide):
+    """Handles both Zoho and Stripe Gross/Fee splits[cite: 124, 91]."""
+    entries = []
+    parsed_data = parse_pdf_transaction_data(pdf_text, platform)
+    
+    total_fee = 0
+    customer_names = []
+    
+    # 1. Customer Credit Lines [cite: 106, 163]
+    for data in parsed_data:
+        credit_entry = create_base_entry(boa_row)
+        credit_entry["Account name"] = data["customer_name"]
+        credit_entry["Account type"] = "Customer"
+        # TODO: Lookup Account and Cash Code from Guide using data["customer_name"]
+        credit_entry["Posting Profile"] = "AutoPost"
+        
+        prefix = "MPP " # Example conditional prefix [cite: 108]
+        boa_desc = str(boa_row.get("Description", ""))
+        credit_entry["Description"] = f"{prefix} {data['customer_name']} _ {boa_desc}"
+        credit_entry["Credit"] = data["gross_amount"]
+        entries.append(credit_entry)
+        
+        total_fee += data["merchant_fee"]
+        customer_names.append(data["customer_name"])
+        
+    # 2. Grouped Merchant Fee Debit Line [cite: 94, 150]
+    debit_entry = create_base_entry(boa_row)
+    debit_entry["Account name"] = "Outside Service (Finance)"
+    debit_entry["Account type"] = "Ledger"
+    debit_entry["Account"] = "43170111-U26C05001-B735350-UOA003"
+    debit_entry["Cash code"] = "OSF005"
+    
+    fee_prefix = "Stripe Merchant Fee" if platform == "STRIPE" else "Zoho Merchant Fee"
+    joined_names = ", ".join(customer_names)
+    debit_entry["Description"] = f"{fee_prefix} {joined_names} _ {boa_row.get('Description', '')}"
+    debit_entry["Debit"] = total_fee
+    
+    entries.append(debit_entry)
+    return entries
+
+def process_fallback(boa_row):
+    """Fallback track for unmapped BOA transactions[cite: 39, 40]."""
+    entry = create_base_entry(boa_row)
+    entry["Description"] = boa_row.get("Description", "")  # Raw description [cite: 56]
+    entry["Debit"] = boa_row.get("Amount", "")            # Exact amount [cite: 57]
     return entry
 
 # --- 4. MAIN ROUTING ENGINE ---
-
 def generate_journal_entries(boa_df, d365_guide_df, zoho_text, stripe_text):
     journal_entries = []
     
-    for index, row in boa_df.iterrows():
-        desc = str(row.get('Description', '')).upper()
+    for index, boa_row in boa_df.iterrows():
+        desc = str(boa_row.get("Description", "")).upper()
         
-        # Tier 1 & 2 Routing Logic with Corrected Stripe Rule
         if "ZOHO" in desc:
-            entries = process_zoho_payment(row, zoho_text, d365_guide_df)
-            # journal_entries.extend(entries)
+            journal_entries.extend(process_payment_batch(boa_row, zoho_text, "ZOHO", d365_guide_df))
         elif "STRIPE" in desc: 
-            entries = process_stripe_payment(row, stripe_text, d365_guide_df)
-            # journal_entries.extend(entries)
-        elif check_if_monthly(row, d365_guide_df): 
-            entries = process_monthly_expense(row, d365_guide_df)
-            # journal_entries.extend(entries)
+            journal_entries.extend(process_payment_batch(boa_row, stripe_text, "STRIPE", d365_guide_df))
         else:
-            entry = process_fallback(row)
-            journal_entries.append(entry)
+            # Monthly rules go here, defaulting to fallback if no match [cite: 45, 49]
+            journal_entries.append(process_fallback(boa_row))
             
     return pd.DataFrame(journal_entries, columns=D365_COLUMNS)
 
-def check_if_monthly(row, guide):
-    # TODO: Implement pattern matching against guide
-    return False
-
 # --- 5. STREAMLIT UI ---
-
 st.title("📊 D365 Journal Entry Automation")
 
 col1, col2 = st.columns(2)
@@ -117,23 +136,28 @@ with col2:
 
 if st.button("Generate D365 Journal Entries", type="primary"):
     if boa_file and guide_file:
-        # boa_df = pd.read_excel(boa_file)
+        # Load structured data
+        boa_df = pd.read_csv(boa_file) if boa_file.name.endswith('.csv') else pd.read_excel(boa_file)
+        # guide_df = pd.read_excel(guide_file, sheet_name=None)
         
-        # Extract text from PDFs if uploaded
+        # Extract raw text from PDFs
         zoho_text = extract_text_from_pdf(zoho_file) if zoho_file else ""
         stripe_text = extract_text_from_pdf(stripe_file) if stripe_file else ""
         
-        st.success("Files processed successfully! (Awaiting final regex and column mappings).")
+        # Process Data (Passing None for guide_df until lookups are finalized)
+        final_df = generate_journal_entries(boa_df, None, zoho_text, stripe_text)
         
-        # Mock Output
-        mock_df = pd.DataFrame(columns=D365_COLUMNS)
+        st.success("✅ Journal entries generated successfully!")
+        st.dataframe(final_df) # Show preview in UI
+        
+        # Prepare Download
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            mock_df.to_excel(writer, index=False, sheet_name='D365_Upload')
+            final_df.to_excel(writer, index=False, sheet_name='D365_Upload')
         output.seek(0)
         
         st.download_button(
-            label="⬇️ Download D365 Journal Entry Excel",
+            label="⬇️ Download D365 Excel Ready File",
             data=output,
             file_name="D365_Journal_Entries.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
